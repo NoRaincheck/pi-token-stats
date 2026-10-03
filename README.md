@@ -25,6 +25,8 @@ Every assistant message in a Pi session gets a `custom` entry with type `token_s
     "decodeTokens": 341,
     "genTps": 134,
     "decodeTps": 67.5,
+    "prefillTps": 4609.1,
+    "cacheAwarePrefillTokens": 82,
     "liveSeconds": 2.552,
     "inputTokens": 8420,
     "outputTokens": 342,
@@ -64,7 +66,9 @@ At the end of each turn (user prompt → final AI response), an aggregate summar
 |-------|-------------|
 | `ttftMs` | Time-to-first-token — wall time from provider request to first streamed chunk |
 | `decodeTps` | Decode throughput (tokens/second) during the live streaming window, excluding the first chunk |
-| `genTps` | Generation throughput — total output tokens / full generation wall time (includes TTFT + decode) |
+| `decodeTps` | Decode throughput (tokens/second) during the live streaming window, excluding the first chunk |
+| `prefillTps` | Effective prefill throughput: inputTokens / TTFT seconds. Includes network + queue latency — reflects end-to-end client experience, not pure server-side compute. |
+| `cacheAwarePrefillTokens` | Cache-aware effective prefill tokens (input − cache reads). When most of a prompt was served from KV-cache, raw TTFT is misleadingly small — this field estimates actual compute work instead. Absent if no cache reads reported. |
 | `inputTokens` | Prompt tokens sent to the provider |
 | `outputTokens` | Tokens returned by the model |
 | `cacheReadTokens` | Cached prompt tokens from provider cache |
@@ -80,17 +84,17 @@ Place the extension where Pi can find it:
 
 ```bash
 # Personal extensions (recommended)
-cp token-speed-tracker.ts ~/.pi/agent/extensions/token-speed-tracker.ts
+cp index.ts ~/.pi/agent/extensions/token-speed-tracker.ts
 
 # Or in your project directory
-mkdir -p .pi/agent/extensions && cp token-speed-tracker.ts .pi/agent/extensions/
+mkdir -p .pi/agent/extensions && cp index.ts .pi/agent/extensions/
 ```
 
 Then start Pi — it auto-loads all `.ts` files from the extensions directory:
 
 ```bash
 cd /your/project
-pi --extension ./token-speed-tracker.ts
+pi --extension ./index.ts
 # Or for personal config, just run:
 pi
 ```
@@ -102,8 +106,6 @@ Edit `~/.pi/agent/extensions/token-speed-tracker.ts` and modify these settings i
 | Config | Default | Description |
 |--------|---------|-------------|
 | `ewmaAlpha` | 0.3 | EWMA smoothing for character→token ratio calibration |
-| `showStatus` | true | Show live TTFT/TPS in the footer during streaming |
-| `ttftWarmupMs` | 150 | Threshold below which TTFT is considered "warming up" |
 
 ## Usage examples
 
@@ -131,15 +133,13 @@ jq 'map(.ttftMs) | {avg: (add / length), min: min, max: max, count: length}' sta
 jq -s 'group_by(.model) | map({model: .[0].model, avgTTFTMs: (map(.ttftMs) | add/length), totalOutputTokens: (map(.outputTokens) | add)})' stats.json
 ```
 
-## Live status display
+### Comparing prefill throughput across providers
 
-When `showStatus` is true, the footer shows real-time updates during streaming:
+```bash
+jq -s 'group_by(.providerId) | map({provider: .[0].providerId, avgPrefillTps: (map(.prefillTps // 0) | add/length), minTTFTMs: (map(.ttftMs | select(.)) | min)})' stats.json
+```
 
-```
-⏱ TTFT: ~1823ms …     → waiting for first chunk
-⚡ 67.5 t/s · 342 tok  → streaming (live TPS)
-✓ 342 tok · ttft 1823ms, 67.5 tok/s   → message complete
-```
+
 
 ## Calibration
 
@@ -159,5 +159,8 @@ PI_TOKEN_SPEED_STATS_DIR=/custom/path pi
 ## Notes
 
 - **TTFT** includes network latency, server queue time, prefill time, and first-chunk decode time. It is not pure prefill throughput.
+- **Prefill TPS (`prefillTps`)** = `inputTokens / (ttftMs / 1000)`. This is an effective client-side estimate — it reflects end-to-end experience from request send to first token arrival, which includes network round-trip time and server queue wait. It should not be interpreted as pure server-side prefill compute throughput.
+- **Cache-aware prefill (`cacheAwarePrefillTokens`)** subtracts cache-read tokens from input to estimate actual compute work during prefill. When most of a prompt is served from KV-cache, raw TTFT can be very small — this field helps distinguish "fast because cached" from "fast because good hardware/network." Use `prefillTps` computed against just the uncached fraction for that comparison.
 - **Decode TPS** excludes tokens delivered in the very first chunk (which inflate the initial rate). It measures only the sustained streaming phase.
+- No status bar or live display — all data is recorded silently into the session JSONL for post-hoc analysis.
 - **vLLM Prometheus metrics** (prefill tokens/TPS) are supported by the reference implementation but require a separate metrics endpoint configuration — not included here since the extension operates purely through Pi event hooks without needing network access.

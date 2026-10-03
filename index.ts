@@ -6,7 +6,7 @@
  * as `custom` entries so it survives resume / fork and can be queried later by
  * any tool or script that reads the session file.
  *
- * Each line in `.pi/agent/sessions/**/*.jsonl`:
+ * Each line in `.pi/agent/sessions/**.jsonl`:
  *
  *   {"type":"custom","customType":"token_speed_stats",
  *    "data":{"providerId":"anthropic","model":"claude-sonnet-4-5",
@@ -50,6 +50,14 @@ export interface TokenSpeedStatsEntry {
   genTps?: number;
   /** Decode-only throughput through the live window. */
   decodeTps?: number;
+  /** Effective prefill throughput: inputTokens / TTFT seconds.
+   *  Includes network + queue latency — reflects end-to-end client experience,
+   *  not pure server-side prefill compute time. */
+  prefillTps?: number;
+  /** Cache-aware effective prefill tokens (input − cache reads).
+   *  Useful for estimating actual compute when a large fraction of input
+   *  was served from KV-cache, making raw TTFT misleadingly small. */
+  cacheAwarePrefillTokens?: number;
   /** Live-window duration in seconds (same as decodeSeconds but named for clarity). */
   liveSeconds?: number;
 
@@ -107,24 +115,6 @@ function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
 }
 
-export function formatTokens(value: number | undefined): string {
-  if (value === undefined) return "?";
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
-  return String(value);
-}
-
-export function formatDuration(milliseconds: number): string {
-  const totalSeconds = Math.max(0, Math.round(milliseconds / 1000));
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  if (minutes < 60) return `${minutes}m ${totalSeconds % 60}s`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ${minutes % 60}m`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ${hours % 24}h`;
-}
-
 function safeDivide(numerator: number, denominator: number): number | undefined {
   if (denominator <= 0) return undefined;
   const result = numerator / denominator;
@@ -147,7 +137,7 @@ interface CalibrationBucket {
   samples: number;
 }
 
-let calibrationState: CalibrationState | null = null;
+let calibrationState: CalibrationState | null = loadCalibration();
 
 function loadCalibration(): CalibrationState {
   const path = calibrationPath();
@@ -196,7 +186,6 @@ function charsToTokens(state: CalibrationState, modelKey: string, chars: number)
 
 // ─── Per-request tracking state ──────────────────────────────────────────────
 
-let pendingRequestAt: number | null = null;
 let pendingProviderId: string | null = null;
 let pendingApi: string | null = null;
 let pendingModel: string | null = null;
@@ -221,14 +210,6 @@ function modelKey(providerId: string, api: string, model: string): string {
 // ─── Main factory ────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let config = {
-    ewmaAlpha: 0.3,
-    showStatus: true,
-    ttftWarmupMs: 150,
-  };
-
-  calibrationState = loadCalibration();
-
   // Per-turn accumulator for aggregation at turn_end.
   const turnStatsCollector: TokenSpeedStatsEntry[] = [];
 
@@ -268,11 +249,26 @@ export default function (pi: ExtensionAPI) {
       ? safeDivide(decodeTokens, liveSeconds)
       : undefined;
 
+    // Prefill throughput — effective client-side estimate.
+    let prefillTps: number | undefined;
+    let cacheAwarePrefillTokens: number | undefined;
+    if (isFiniteNumber(ttftMs) && ttftMs > 0 && inputTokens !== undefined && inputTokens > 0) {
+      const ttftSeconds = ttftMs / 1000;
+      prefillTps = round(inputTokens / ttftSeconds, 2);
+      // Cache-aware: subtract cached reads to estimate actual compute work.
+      if (cacheReadTokens !== undefined && cacheReadTokens > 0) {
+        const aware = inputTokens - cacheReadTokens;
+        if (aware > 0) {
+          cacheAwarePrefillTokens = aware;
+        }
+      }
+    }
+
     // Calibration update.
     if (outputTokens !== undefined && outputTokens > 0) {
       const totalChars = m.streamedCharsText + m.streamedCharsThinking + m.streamedCharsToolCall;
       if (totalChars > 0) {
-        updateCalibration(calibrationState, mk, config.ewmaAlpha, totalChars, outputTokens);
+        updateCalibration(calibrationState, mk, 0.3, totalChars, outputTokens);
       }
     }
 
@@ -282,7 +278,7 @@ export default function (pi: ExtensionAPI) {
       messageStartAt: m.firstChunkAt > 0 ? m.firstChunkAt : null,
       lastChunkAt: m.lastChunkAt > 0 ? m.lastChunkAt : null,
       ttftMs, decodeSeconds, decodeTokens,
-      genTps, decodeTps, liveSeconds,
+      genTps, decodeTps, prefillTps, cacheAwarePrefillTokens, liveSeconds,
       inputTokens, outputTokens, cacheReadTokens,
       totalTokens: (inputTokens ?? 0) + (outputTokens ?? 0) + (cacheReadTokens ?? 0),
       intermediateToolCalls: intermediateToolCallsForCurrentResponse || undefined,
@@ -295,18 +291,18 @@ export default function (pi: ExtensionAPI) {
   /** Reset everything at the start of each turn. */
   pi.on("turn_start", () => {
     activeMessage = null;
-    pendingRequestAt = null;
     pendingProviderId = null;
+    pendingApi = null;
+    pendingModel = null;
     intermediateToolCallsForCurrentResponse = 0;
   });
 
   pi.on("session_shutdown", () => {
-    saveCalibration(calibrationState);
+    if (calibrationState) saveCalibration(calibrationState);
   });
 
-  pi.on("model_select", (event) => {
+  pi.on("model_select", () => {
     activeMessage = null;
-    pendingRequestAt = null;
   });
 
   /** Count tool calls between assistant messages. */
@@ -316,13 +312,15 @@ export default function (pi: ExtensionAPI) {
 
   // ── Provider request lifecycle ───────────────────────────────────────
 
+  let pendingRequestAt: number | null = null;
+
   pi.on("before_provider_request", () => {
     pendingRequestAt = Date.now();
   });
 
   // ── Assistant message streaming ──────────────────────────────────────
 
-  pi.on("message_start", (event, ctx) => {
+  pi.on("message_start", (event) => {
     if (event.message.role !== "assistant") return;
 
     const providerId = event.message.provider ?? pendingProviderId;
@@ -344,13 +342,6 @@ export default function (pi: ExtensionAPI) {
       streamedCharsToolCall: 0,
       exactOutputTokensOnStream: 0,
     };
-
-    if (ctx && config.showStatus) {
-      const ttftMs = pendingRequestAt !== null ? Date.now() - pendingRequestAt : undefined;
-      ctx.ui.setStatus(ENTRY_TYPE, ttftMs !== undefined && ttftMs > config.ttftWarmupMs
-        ? `⏱ TTFT: ~${ttftMs}ms …`
-        : "⏱ TTFT: waiting");
-    }
   });
 
   pi.on("message_update", (event) => {
@@ -376,18 +367,6 @@ export default function (pi: ExtensionAPI) {
     const partialOutput = rawEvent.partial?.usage?.output as number | undefined;
     if (isFiniteNumber(partialOutput) && partialOutput > activeMessage.exactOutputTokensOnStream) {
       activeMessage.exactOutputTokensOnStream = Math.round(partialOutput);
-    }
-
-    // Live status update.
-    const m = activeMessage;
-    const genTps = safeDivide(m.exactOutputTokensOnStream,
-      m.requestStartAt !== null ? (Date.now() - m.requestStartAt) / 1000 : undefined);
-    const tokenText = formatTokens(m.exactOutputTokensOnStream > 0 ? m.exactOutputTokensOnStream : undefined);
-
-    if (ctx && config.showStatus && genTps && genTps > 0) {
-      ctx.ui.setStatus(ENTRY_TYPE, `⚡ ${genTps} t/s · ${tokenText}`);
-    } else if (ctx && config.showStatus && tokenText !== "?") {
-      ctx.ui.setStatus(ENTRY_TYPE, tokenText);
     }
   });
 
@@ -417,6 +396,7 @@ export default function (pi: ExtensionAPI) {
       providerId, api, model,
       inputTokens, outputTokens, cacheReadTokens,
     );
+
     if (stats && event.message.stopReason) {
       stats.stopReason = event.message.stopReason;
     }
@@ -426,25 +406,13 @@ export default function (pi: ExtensionAPI) {
       turnStatsCollector.push(stats);
     }
 
-    // Live status: final result.
-    if (ctx && config.showStatus) {
-      const outText = outputTokens !== undefined ? formatTokens(outputTokens) : "?";
-      const ttftText = stats?.ttftMs !== undefined
-        ? ` · ttft ${Math.round(stats.ttftMs)}ms`
-        : "";
-      const tpsText = stats?.decodeTps !== undefined
-        ? `, ${stats.decodeTps} tok/s`
-        : "";
-      ctx.ui.setStatus(ENTRY_TYPE, `✓ ${outText} tok${ttftText}${tpsText}`);
-    }
-
     // Reset per-message state.
     activeMessage = null;
     intermediateToolCallsForCurrentResponse = 0;
   });
 
   /** Emit an aggregate turn summary from all accumulated stats. */
-  pi.on("turn_end", (_event, ctx) => {
+  pi.on("turn_end", () => {
     if (turnStatsCollector.length === 0) return;
 
     const totalInputTokens = turnStatsCollector.reduce((s, t) => s + (t.inputTokens ?? 0), 0);
@@ -462,10 +430,6 @@ export default function (pi: ExtensionAPI) {
 
     const providerId = turnStatsCollector[0]?.providerId ?? "";
     const models = [...new Set(turnStatsCollector.map(t => t.model))];
-
-    if (config.showStatus) {
-      ctx.ui.setStatus(ENTRY_TYPE, `turn summary: ${turnStatsCollector.length} messages, ${totalOutputTokens} tok`);
-    }
 
     pi.appendEntry<TokenSpeedTurnSummary>(SUMMARY_ENTRY_TYPE, {
       timestamp: Date.now(),
@@ -485,5 +449,4 @@ export default function (pi: ExtensionAPI) {
     // Clear the accumulator for next turn.
     turnStatsCollector.length = 0;
   });
-
 }
