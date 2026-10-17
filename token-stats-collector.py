@@ -10,7 +10,9 @@
 Walks ~/.pi/agent/sessions/**/*.jsonl, extracts ``token_speed_stats`` entries,
 bins by totalTokens (Short <4K, Medium 4–16K, Long 16–64K, XLarge 64K+)
 and cache level (cold / warm), then prints a summary table with median,
-quartiles, IQR, and mean grouped by (cacheLevel, contextBin).
+quartiles, IQR, and mean grouped by (cacheLevel, contextBin).  PrefillTps is
+not reported — the measurement is unreliable due to a timing bug in the
+extension.
 
 Usage:
 
@@ -29,20 +31,18 @@ import json
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from rich.console import Console
+from rich.text import Text
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-# The calibration fix (commit 7470c8c) corrects the TTFT measurement for cold
-# entries by comparing the measured TTFT against a model calibration (or
-# a sensible default of 1 500 tok/s).  Before that fix, measured TTFT values
-# were impossibly small (5–23ms) causing prefillTps to reach millions of
-# tok/s.  All prefillTps for entries collected before the fix date is
-# excluded from aggregation; all other metrics (TTFT, decodeTps, genTps,
-# costs, token counts) are unaffected and included normally.
-PREFILL_FIX_DATE = datetime(2026, 10, 18, 3, 23, 48, tzinfo=timezone.utc)
+# The TTFT measurement for cold entries is unreliable before the calibration
+# fix (commit 7470c8c) — values were impossibly small (5–23ms) because
+# before_provider_request fires too late in a session.  PrefillTps is
+# entirely excluded from the report.  All other metrics (TTFT, decodeTps,
+# genTps, costs, token counts) are included normally.
 
 SESSIONS_BASE = Path(
     os.environ.get(
@@ -59,10 +59,69 @@ CONTEXT_BINS: list[tuple[str, int | float, int | float]] = [
     ("xlarge", 64_000,    float("inf")),
 ]
 
-METRICS = ["ttftMs", "decodeTps", "genTps", "prefillTps"]
+METRICS = ["ttftMs", "decodeTps", "genTps"]
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+console = Console(force_terminal=True, color_system="truecolor")
+
+
+def c(*parts, **kwargs) -> None:
+    """Shortcut: print with Rich Console."""
+    console.print(*parts, **kwargs)
+
+
+def colorize_cache_label(label: str) -> Text:
+    """Colorize cache level labels."""
+    t = Text(label)
+    if label == "cold":
+        t.stylize("bold red")
+    elif label == "warm":
+        t.stylize("bold green")
+    return t
+
+
+def colorize_context_label(label: str) -> Text:
+    """Colorize context bin labels."""
+    t = Text(label)
+    colors = {"short": "cyan", "medium": "yellow", "long": "magenta", "xlarge": "magenta"}
+    if label in colors:
+        t.stylize(colors[label])
+    return t
+
+
+def colorize_metric_name(name: str) -> Text:
+    """Colorize metric names."""
+    t = Text(name)
+    colors = {"TTFT": "bold yellow", "Decode TPS": "bold cyan", "Gen TPS": "bold green"}
+    if name in colors:
+        t.stylize(colors[name])
+    return t
+
+
+# TPS performance bands for value colorization (tok/s)
+TPS_BANDS: list[tuple[int | float, str]] = [
+    (0, "#ff4444"),        # Slow (red)
+    (15, "#ffaa00"),       # Medium (orange)
+    (30, "#00ff88"),       # Fast (green)
+    (45, "#44ddff"),       # Blazing (cyan)
+]
+
+
+def colorize_tps_value(val: float) -> Text:
+    """Colorize a TPS value based on performance bands."""
+    import re as _re
+    s = f"{val:.1f}"
+    t = Text(s)
+    for threshold, color in TPS_BANDS:
+        if val <= threshold:
+            t.stylize(color)
+            return t
+    # Fallback (val > 45)
+    t.stylize("#44ddff")
+    return t
+
 
 def collect_unique_models(entries: list[dict]) -> list[str]:
     """Return a sorted list of unique model names from entries."""
@@ -200,49 +259,6 @@ def _median(sorted_vals: list[float]) -> float:
 
 # ─── File reading ─────────────────────────────────────────────────────────────
 
-TIMESTAMP_FIELDS = ["date", "timestamp", "time", "createdAt", "timeMs"]
-
-
-def _entry_before_prefill_fix(raw: dict) -> bool:
-    """Return True if a session entry was recorded before the prefill fix.
-
-    Used only to decide whether to exclude **prefillTps** for that
-    single entry.  All other metrics are always included.
-    """
-    for field in TIMESTAMP_FIELDS:
-        val = raw.get(field)
-        if val is None:
-            continue
-        # Handle epoch milliseconds
-        if isinstance(val, (int, float)) and val > 1e12:
-            try:
-                dt = datetime.fromtimestamp(val / 1000, tz=timezone.utc)
-                return dt < PREFILL_FIX_DATE
-            except (OSError, ValueError, OverflowError):
-                pass
-        # Handle ISO-8601 / RFC-3339 strings
-        if isinstance(val, str):
-            val = val.strip()
-            for fmt in (
-                "%Y-%m-%dT%H:%M:%S.%f%z",
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S.%f",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S.%f%z",
-                "%Y-%m-%d %H:%M:%S%z",
-                "%Y-%m-%d %H:%M:%S.%f",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d",
-            ):
-                try:
-                    dt = datetime.strptime(val, fmt)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    return dt < PREFILL_FIX_DATE
-                except ValueError:
-                    continue
-    return False
-
 
 def jsonl_entries(path: Path):
     """Yield parsed JSON objects from a JSONL file."""
@@ -316,30 +332,14 @@ def aggregate(entries: list[dict]) -> tuple[dict[str, dict], set[str]]:
                 "ttftMs": [],
                 "decodeTps": [],
                 "genTps": [],
-                "prefillTps": [],
                 "totalTokens": [],
                 "inputTokens": [],
                 "outputTokens": [],
-                "prefillExcluded": 0,
-                "models": set[str](),
             }
 
         g = groups[key]
         g["count"] += 1
-        if model:
-            g["models"].add(model)
-
-        # Exclude prefillTps for entries collected before the calibration fix.
-        # The extension's calibration fix (commit 7470c8c) corrects unreliable
-        # TTFT measurements for cold entries; without it, prefillTps values
-        # can reach millions of tok/s.  We skip only prefillTps; all other
-        # metrics (TTFT, decodeTps, genTps, costs, token counts) are kept.
-        if _entry_before_prefill_fix(raw):
-            g["prefillExcluded"] += 1
-
         for m in METRICS:
-            if m == "prefillTps" and _entry_before_prefill_fix(raw):
-                continue  # skip prefillTps for pre-fix entries
             v = raw.get(m)
             if v is not None and isinstance(v, (int, float)):
                 g[m].append(float(v))
@@ -363,16 +363,19 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
     sep = "=" * 72
     thin_sep = "-" * 72
 
-    print(f"\n{sep}")
-    print("  PI TOKEN STATISTICS — Aggregated from session JSONL")
-    print(f"  Sessions dir: {SESSIONS_BASE / 'sessions'}")
-    print(f"  Total groups: {len(groups)}  "
-          "(cold/warm × short/medium/long/xlarge)")
+    c(f"\n{sep}")
+    header = Text("  PI TOKEN STATISTICS — Aggregated from session JSONL")
+    header.stylize("bold")
+    c(header)
+    c(f"  Sessions dir: {SESSIONS_BASE / 'sessions'}")
+    total_line = Text(f"  Total groups: {len(groups)}  (cold/warm × short/medium/long/xlarge)")
+    total_line.stylize("bold blue")
+    c(total_line)
     if all_models:
-        print(f"  Models included:  " + ", ".join(sorted(all_models)))
+        c(f"  Models included:  " + ", ".join(sorted(all_models)))
     else:
-        print("  Models included:  (unknown)")
-    print(sep)
+        c("  Models included:  (unknown)")
+    c(sep)
 
     # Sort: cold before warm, short before xlarge
     order_cache = {"cold": 0, "warm": 1}
@@ -390,28 +393,28 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
         if g["count"] == 0:
             continue
 
-        print(f"\n{thin_sep}")
-        model_list = g.get("models")
-        model_info = f"  Models: {', '.join(sorted(model_list))}" if model_list else "  Models: (unknown)"
-        prefill_note = (f"  (prefillTps excluded for {g['prefillExcluded']} entries "
-                        f"collected before the calibration fix)"
-                        if g.get("prefillExcluded", 0) > 0 else "")
-        print(f"  {g['label']}     (n = {g['count']})\n{model_info}")
-        if prefill_note:
-            print(f"  {prefill_note}")
+        # Parse the group label to colorize cache/context parts
+        parts = g["label"].split(" × ")
+        cache_part = parts[0] if parts else "cold"
+        context_part = parts[1] if len(parts) > 1 else "short [0–4,000]"
+        cache_text = colorize_cache_label(cache_part)
+        context_text = colorize_context_label(context_part)
+        group_title = Text(f"  {cache_text} × {context_part}")
+        count_text = Text(f"  (n = {g['count']})")
+        count_text.stylize("dim")
+        c(f"\n{thin_sep}")
+        c(f"  {group_title}     ", count_text)
 
         # Summary table with median, Q1, Q3, IQR, plus mean for reference
         labels = {
             "ttftMs": "TTFT",
             "decodeTps": "Decode TPS",
             "genTps": "Gen TPS",
-            "prefillTps": "Prefill TPS",
         }
         units = {
             "ttftMs": "ms",
             "decodeTps": "tok/s",
             "genTps": "tok/s",
-            "prefillTps": "tok/s",
         }
 
         hdr = (f"  {'Metric':<16}"
@@ -419,8 +422,8 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
                f" {'Avg':>10}  {'Min':>12}  {'Max':>12}  {'Units':>10}")
         sep_line = (f"  {'─' * 14}  {'─' * 10}  {'─' * 10}  {'─' * 10}  {'─' * 10}"
                     f"  {'─' * 10}  {'─' * 12}  {'─' * 12}  {'─' * 10}")
-        print(hdr)
-        print(sep_line)
+        c(hdr)
+        c(sep_line)
 
         for m in METRICS:
             vals = g[m]
@@ -433,13 +436,41 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
             q1 = round(_percentile(s, 25), 1)
             q3 = round(_percentile(s, 75), 1)
             iqr = round(q3 - q1, 1)
-            print(f"  {labels[m]:<16} {median:>10.1f}  {q1:>10.1f}  {q3:>10.1f}  {iqr:>10.1f}"
+            row = (f"  {labels[m]:<16} {median:>10.1f}  {q1:>10.1f}  {q3:>10.1f}  {iqr:>10.1f}"
                   f"  {avg:>10.1f}  {mn:>12.1f}  {mx:>12.1f}  "
                   f"{units[m]:>10}")
+            # Colorize the metric name portion
+            metric_name = labels[m]
+            colored_row = Text(row)
+            metric_start = row.find(metric_name)
+            if metric_start >= 0:
+                colored_row.stylize("bold", metric_start, metric_start + len(metric_name))
+            # Colorize TPS values by performance band
+            if m == "decodeTps" or m == "genTps":
+                import re
+                # Match all numeric values in the row (after the metric name)
+                for num_match in re.finditer(r"\d+\.\d+", row):
+                    num_start, num_end = num_match.span()
+                    if num_start > metric_start + len(metric_name):
+                        try:
+                            num_val = float(num_match.group())
+                            # Get the color for this value
+                            color = None
+                            for threshold, clr in TPS_BANDS:
+                                if num_val <= threshold:
+                                    color = clr
+                                    break
+                            if color:
+                                colored_row.stylize(color, num_start, num_end)
+                        except ValueError:
+                            pass
+            c(colored_row)
 
-    print(f"\n{sep}")
-    print("  End of report.")
-    print(sep)
+    c(f"\n{sep}")
+    footer = Text("  End of report.")
+    footer.stylize("dim")
+    c(footer)
+    c(sep)
 
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────
@@ -501,10 +532,7 @@ def main() -> None:
         print(json.dumps(all_raw, indent=2, default=str))
         return
 
-    if not all_raw:
-        print("No token_speed_stats entries found. "
-              "Run pi with the token-speed-tracker extension first.")
-        return
+
 
     groups, all_models = aggregate(all_raw)
     display(groups, all_models)
