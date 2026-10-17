@@ -36,22 +36,12 @@ from typing import Any
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 # The prefillTps fix (commit efac9aa) excluded cache reads from the calculation.
-# All data prior to this commit has incorrect prefill TPS values and must be
-# excluded from aggregation.  This date is the commit's author date in UTC.
+# All prefillTps values in entries prior to this commit have incorrect
+# (way too high) numbers, so we silently drop only the prefillTps for
+# those entries.  All other metrics (TTFT, decodeTps, genTps, costs,
+# token counts) are unaffected and are included normally.  This date
+# is the commit's author date in UTC.
 PREFILL_FIX_DATE = datetime(2026, 10, 17, 2, 49, 3, tzinfo=timezone.utc)
-
-# The index.ts extension has a secondary bug: `before_provider_request` fires
-# at the wrong wall-clock time for subsequent requests (it fires when the
-# internal request is queued, not when the HTTP request is actually sent).
-# This makes measured `ttftMs` impossibly small (5–23ms) for cold entries
-# with 10K+ tokens, producing prefillTps values of 1–16M tok/s.
-#
-# The index.ts fix (see commit in index.ts) uses a per-model calibration
-# to detect and correct unreliable measured TTFT.  Until that fix is
-# deployed and accepted, entries generated between the efac9aa cutoff and
-# the index.ts fix are excluded.  This date is set after the index.ts fix
-# commit to ensure we only include data from both fixes being live.
-COLLECTION_FIX_DATE = datetime(2026, 10, 18, 0, 0, 0, tzinfo=timezone.utc)
 
 SESSIONS_BASE = Path(
     os.environ.get(
@@ -212,8 +202,12 @@ def _median(sorted_vals: list[float]) -> float:
 TIMESTAMP_FIELDS = ["date", "timestamp", "time", "createdAt", "timeMs"]
 
 
-def _entry_before_cutoff(raw: dict) -> bool:
-    """Return True if a session entry was recorded before either fix."""
+def _entry_before_prefill_fix(raw: dict) -> bool:
+    """Return True if a session entry was recorded before the prefill fix.
+
+    Used only to decide whether to exclude **prefillTps** for that
+    single entry.  All other metrics are always included.
+    """
     for field in TIMESTAMP_FIELDS:
         val = raw.get(field)
         if val is None:
@@ -222,7 +216,7 @@ def _entry_before_cutoff(raw: dict) -> bool:
         if isinstance(val, (int, float)) and val > 1e12:
             try:
                 dt = datetime.fromtimestamp(val / 1000, tz=timezone.utc)
-                return dt < COLLECTION_FIX_DATE  # use the later of the two dates
+                return dt < PREFILL_FIX_DATE
             except (OSError, ValueError, OverflowError):
                 pass
         # Handle ISO-8601 / RFC-3339 strings
@@ -243,7 +237,7 @@ def _entry_before_cutoff(raw: dict) -> bool:
                     dt = datetime.strptime(val, fmt)
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
-                    return dt < COLLECTION_FIX_DATE  # use the later of the two dates
+                    return dt < PREFILL_FIX_DATE
                 except ValueError:
                     continue
     return False
@@ -269,12 +263,7 @@ def jsonl_entries(path: Path):
 
 
 def find_entries(base: Path, verbose: bool = True):
-    """Yield all token_speed_stats entry data dicts from all sessions.
-
-    Entries whose *date / timestamp* falls before the prefillTps fix
-    (commit efac9aa, 2026-10-17) are silently excluded, because their
-    prefill TPS values are known to be incorrect.
-    """
+    """Yield all token_speed_stats entry data dicts from all sessions."""
     sessions_dir = base / "sessions"
     if not sessions_dir.is_dir():
         print(f"[WARN] sessions directory not found: {sessions_dir}",
@@ -288,20 +277,13 @@ def find_entries(base: Path, verbose: bool = True):
             continue
         seen.add(resolved)
         count = 0
-        filtered_out = 0
         for entry in jsonl_entries(jsonl_file):
             if (entry.get("type") == "custom"
                     and entry.get("customType") == ENTRY_TYPE):
-                raw = entry.get("data", {})
-                if _entry_before_cutoff(raw):
-                    filtered_out += 1
-                    continue
                 count += 1
-                yield raw
+                yield entry.get("data", {})
         if count and verbose:
-            extra = (f" (excluded {filtered_out} pre-fix entries)"
-                     if filtered_out else "")
-            print(f"  {jsonl_file.name}  ({count} entries){extra}")
+            print(f"  {jsonl_file.name}  ({count} entries)")
 
 
 # ─── Aggregation ──────────────────────────────────────────────────────────────
@@ -337,6 +319,7 @@ def aggregate(entries: list[dict]) -> tuple[dict[str, dict], set[str]]:
                 "totalTokens": [],
                 "inputTokens": [],
                 "outputTokens": [],
+                "prefillExcluded": 0,
                 "models": set[str](),
             }
 
@@ -344,7 +327,16 @@ def aggregate(entries: list[dict]) -> tuple[dict[str, dict], set[str]]:
         g["count"] += 1
         if model:
             g["models"].add(model)
+
+        # Only include prefillTps for entries from after the fix commit.
+        # Entries before that commit have invalid (way too high) prefillTps
+        # values; we skip only that metric — everything else is fine.
+        if _entry_before_prefill_fix(raw):
+            g["prefillExcluded"] += 1
+
         for m in METRICS:
+            if m == "prefillTps" and _entry_before_prefill_fix(raw):
+                continue  # skip invalid prefillTps for pre-fix entries
             v = raw.get(m)
             if v is not None and isinstance(v, (int, float)):
                 g[m].append(float(v))
@@ -398,7 +390,11 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
         print(f"\n{thin_sep}")
         model_list = g.get("models")
         model_info = f"  Models: {', '.join(sorted(model_list))}" if model_list else "  Models: (unknown)"
+        prefill_note = (f"  (prefillTps excluded for {g['prefillExcluded']} pre-fix entries)"
+                        if g.get("prefillExcluded", 0) > 0 else "")
         print(f"  {g['label']}     (n = {g['count']})\n{model_info}")
+        if prefill_note:
+            print(f"  {prefill_note}")
 
         # Summary table with median, Q1, Q3, IQR, plus mean for reference
         labels = {
