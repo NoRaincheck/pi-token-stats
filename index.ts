@@ -289,19 +289,25 @@ export default function (pi: ExtensionAPI) {
       }
       // Only compute prefillTps when there is actual prefill work.
       if (cacheAware > 0) {
-        // Cold entry with large prompt: check if measured TTFT is reliable
-        if ((cacheReadTokens === undefined || cacheReadTokens === 0) && inputTokens !== undefined && inputTokens > 10_000) {
+        // Cold entry with large prompt: check if measured TTFT is reliable.
+      // The before_provider_request event fires too late (close to response
+      // arrival) for subsequent requests, making TTFT = messageStartAt -
+      // requestStartAt impossibly short (5–23ms).  We detect this by
+      // comparing against an expected TTFT derived from either the
+      // model's calibration or a sensible default (1500 tok/s).
+        if ((cacheReadTokens === undefined || cacheReadTokens === 0)
+            && inputTokens !== undefined && inputTokens > 10_000) {
           const calBucket = getCalibrationBucket(calibrationState, mk);
           const calRate = calBucket.prefillRate;
-          if (calRate > 0) {
-            const predictedTTFT = inputTokens / calRate;  // seconds
-            // If measured TTFT is less than 30% of what calibration predicts,
-            // it means requestStartAt was recorded too late (before_provider_request bug).
-            // Replace measured TTFT with calibrated estimate.
-            if (ttftSeconds < predictedTTFT * 0.3) {
-              ttftMs = round(predictedTTFT * 1000, 1);
-              ttftCalibrated = true;
-            }
+          // When no calibration exists (first session with this model),
+          // use a default prefill rate as a reasonable estimate.
+          const effectiveCalRate = calRate > 0 ? calRate : 1500;
+          const predictedTTFT = inputTokens / effectiveCalRate;  // seconds
+          // If measured TTFT is < 30% of predicted, the before_provider_request
+          // event fired too late.  Replace with the calibrated estimate.
+          if (ttftSeconds < predictedTTFT * 0.3) {
+            ttftMs = round(predictedTTFT * 1000, 1);
+            ttftCalibrated = true;
           }
         }
         prefillTps = round(cacheAware / (ttftMs! / 1000), 2);
