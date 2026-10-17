@@ -139,7 +139,29 @@ jq -s 'group_by(.model) | map({model: .[0].model, avgTTFTMs: (map(.ttftMs) | add
 jq -s 'group_by(.providerId) | map({provider: .[0].providerId, avgPrefillTps: (map(.prefillTps // 0) | add/length), minTTFTMs: (map(.ttftMs | select(.)) | min)})' stats.json
 ```
 
+### Token statistics summary table
 
+```bash
+uv run token-stats-collector.py
+```
+
+Shows a compact summary table grouped by cache level (cold/warm) and context size (short/medium/long/xlarge). Each metric reports Median, Q1, Q3, IQR, and (for reference) mean/min/max:
+
+```
+  TTFT                 Median        Q1        Q3       IQR       Avg       Min       Max      Units
+  ─────────────      ──────────  ──────────  ──────────  ──────────  ──────────  ──────────  ──────────  ──────────
+  TTFT                     45.0      22.0      80.0      58.0       62.3       8.2     1250.0          ms
+  Decode TPS                95.0      60.0     140.0      80.0      102.5      12.5       250.0      tok/s
+  Gen TPS                  120.0      80.0     175.0      95.0      125.3      15.0       300.0      tok/s
+  Prefill TPS             5000.0    3000.0    8000.0     5000.0     5200.0     800.0    12000.0      tok/s
+```
+
+With flags:
+
+```bash
+uv run token-stats-collector.py --filter-model claude  # only Claude models
+uv run token-stats-collector.py --json                 # raw JSON output
+```
 
 ## Calibration
 

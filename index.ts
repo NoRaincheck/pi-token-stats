@@ -250,17 +250,22 @@ export default function (pi: ExtensionAPI) {
       : undefined;
 
     // Prefill throughput — effective client-side estimate.
+    // Excludes cache-read tokens so prefillTps reflects actual server-side
+    // prefill compute, not the artificially high rate caused by fast TTFT
+    // when most tokens were served from KV-cache.
     let prefillTps: number | undefined;
     let cacheAwarePrefillTokens: number | undefined;
     if (isFiniteNumber(ttftMs) && ttftMs > 0 && inputTokens !== undefined && inputTokens > 0) {
       const ttftSeconds = ttftMs / 1000;
-      prefillTps = round(inputTokens / ttftSeconds, 2);
-      // Cache-aware: subtract cached reads to estimate actual compute work.
+      // Cache-aware token count (non-cached portion of the prompt).
+      let cacheAware = inputTokens;
       if (cacheReadTokens !== undefined && cacheReadTokens > 0) {
-        const aware = inputTokens - cacheReadTokens;
-        if (aware > 0) {
-          cacheAwarePrefillTokens = aware;
-        }
+        cacheAware = Math.max(0, inputTokens - cacheReadTokens);
+        cacheAwarePrefillTokens = cacheAware;
+      }
+      // Only compute prefillTps when there is actual prefill work.
+      if (cacheAware > 0) {
+        prefillTps = round(cacheAware / ttftSeconds, 2);
       }
     }
 
