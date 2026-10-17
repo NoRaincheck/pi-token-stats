@@ -35,16 +35,14 @@ from typing import Any
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-# The prefillTps fix (commit efac9aa) excluded cache reads from the calculation.
-# A later fix (calibration-based) corrects the TTFT measurement for cold
+# The calibration fix (commit 7470c8c) corrects the TTFT measurement for cold
 # entries by comparing the measured TTFT against a model calibration (or
-# a sensible default of 1500 tok/s).  Before that calibration-based fix,
-# measured TTFT values were impossibly small (5–23ms) causing prefillTps
-# to reach millions of tok/s — so we drop only prefillTps for entries with
-# values that exceed a sanity threshold (10 000 tok/s for cold entries).
-# All other metrics (TTFT, decodeTps, genTps, costs, token counts) are
-# unaffected and are included normally.
-PREFILL_TPS_THRESHOLD = 10_000  # tok/s — cold entries above this are unreliable
+# a sensible default of 1 500 tok/s).  Before that fix, measured TTFT values
+# were impossibly small (5–23ms) causing prefillTps to reach millions of
+# tok/s.  All prefillTps for entries collected before the fix date is
+# excluded from aggregation; all other metrics (TTFT, decodeTps, genTps,
+# costs, token counts) are unaffected and included normally.
+PREFILL_FIX_DATE = datetime(2026, 10, 18, 3, 23, 48, tzinfo=timezone.utc)
 
 SESSIONS_BASE = Path(
     os.environ.get(
@@ -205,18 +203,45 @@ def _median(sorted_vals: list[float]) -> float:
 TIMESTAMP_FIELDS = ["date", "timestamp", "time", "createdAt", "timeMs"]
 
 
-def _prefill_tps_invalid(raw: dict) -> bool:
-    """Return True if this entry's prefillTps is unreasonably high.
+def _entry_before_prefill_fix(raw: dict) -> bool:
+    """Return True if a session entry was recorded before the prefill fix.
 
     Used only to decide whether to exclude **prefillTps** for that
     single entry.  All other metrics are always included.
     """
-    pt = raw.get("prefillTps")
-    if pt is None or not isinstance(pt, (int, float)):
-        return False
-    ct = raw.get("cacheReadTokens", 0) or 0
-    is_cold = ct == 0
-    return is_cold and pt > PREFILL_TPS_THRESHOLD
+    for field in TIMESTAMP_FIELDS:
+        val = raw.get(field)
+        if val is None:
+            continue
+        # Handle epoch milliseconds
+        if isinstance(val, (int, float)) and val > 1e12:
+            try:
+                dt = datetime.fromtimestamp(val / 1000, tz=timezone.utc)
+                return dt < PREFILL_FIX_DATE
+            except (OSError, ValueError, OverflowError):
+                pass
+        # Handle ISO-8601 / RFC-3339 strings
+        if isinstance(val, str):
+            val = val.strip()
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S.%f%z",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f%z",
+                "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+            ):
+                try:
+                    dt = datetime.strptime(val, fmt)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt < PREFILL_FIX_DATE
+                except ValueError:
+                    continue
+    return False
 
 
 def jsonl_entries(path: Path):
@@ -304,16 +329,17 @@ def aggregate(entries: list[dict]) -> tuple[dict[str, dict], set[str]]:
         if model:
             g["models"].add(model)
 
-        # Only include prefillTps for entries with reasonable values.
-        # Pre-calibration entries have impossibly high prefillTps (> 10k tok/s);
-        # calibrated entries from the extension's fix have correct values
-        # (~1000–2000 tok/s for cold entries).  We skip only the invalid ones.
-        if _prefill_tps_invalid(raw):
+        # Exclude prefillTps for entries collected before the calibration fix.
+        # The extension's calibration fix (commit 7470c8c) corrects unreliable
+        # TTFT measurements for cold entries; without it, prefillTps values
+        # can reach millions of tok/s.  We skip only prefillTps; all other
+        # metrics (TTFT, decodeTps, genTps, costs, token counts) are kept.
+        if _entry_before_prefill_fix(raw):
             g["prefillExcluded"] += 1
 
         for m in METRICS:
-            if m == "prefillTps" and _prefill_tps_invalid(raw):
-                continue  # skip invalid prefillTps for entries with bad values
+            if m == "prefillTps" and _entry_before_prefill_fix(raw):
+                continue  # skip prefillTps for pre-fix entries
             v = raw.get(m)
             if v is not None and isinstance(v, (int, float)):
                 g[m].append(float(v))
@@ -367,8 +393,8 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
         print(f"\n{thin_sep}")
         model_list = g.get("models")
         model_info = f"  Models: {', '.join(sorted(model_list))}" if model_list else "  Models: (unknown)"
-        prefill_note = (f"  (prefillTps excluded for {g['prefillExcluded']} entries with "
-                        f"unreasonably high values >{PREFILL_TPS_THRESHOLD:,} tok/s)"
+        prefill_note = (f"  (prefillTps excluded for {g['prefillExcluded']} entries "
+                        f"collected before the calibration fix)"
                         if g.get("prefillExcluded", 0) > 0 else "")
         print(f"  {g['label']}     (n = {g['count']})\n{model_info}")
         if prefill_note:
