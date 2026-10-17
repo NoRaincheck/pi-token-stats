@@ -40,6 +40,19 @@ from typing import Any
 # excluded from aggregation.  This date is the commit's author date in UTC.
 PREFILL_FIX_DATE = datetime(2026, 10, 17, 2, 49, 3, tzinfo=timezone.utc)
 
+# The index.ts extension has a secondary bug: `before_provider_request` fires
+# at the wrong wall-clock time for subsequent requests (it fires when the
+# internal request is queued, not when the HTTP request is actually sent).
+# This makes measured `ttftMs` impossibly small (5–23ms) for cold entries
+# with 10K+ tokens, producing prefillTps values of 1–16M tok/s.
+#
+# The index.ts fix (see commit in index.ts) uses a per-model calibration
+# to detect and correct unreliable measured TTFT.  Until that fix is
+# deployed and accepted, entries generated between the efac9aa cutoff and
+# the index.ts fix are excluded.  This date is set after the index.ts fix
+# commit to ensure we only include data from both fixes being live.
+COLLECTION_FIX_DATE = datetime(2026, 10, 18, 0, 0, 0, tzinfo=timezone.utc)
+
 SESSIONS_BASE = Path(
     os.environ.get(
         "PI_TOKEN_SPEED_STATS_DIR",
@@ -200,7 +213,7 @@ TIMESTAMP_FIELDS = ["date", "timestamp", "time", "createdAt", "timeMs"]
 
 
 def _entry_before_cutoff(raw: dict) -> bool:
-    """Return True if a session entry was recorded before the prefill fix."""
+    """Return True if a session entry was recorded before either fix."""
     for field in TIMESTAMP_FIELDS:
         val = raw.get(field)
         if val is None:
@@ -209,7 +222,7 @@ def _entry_before_cutoff(raw: dict) -> bool:
         if isinstance(val, (int, float)) and val > 1e12:
             try:
                 dt = datetime.fromtimestamp(val / 1000, tz=timezone.utc)
-                return dt < PREFILL_FIX_DATE
+                return dt < COLLECTION_FIX_DATE  # use the later of the two dates
             except (OSError, ValueError, OverflowError):
                 pass
         # Handle ISO-8601 / RFC-3339 strings
@@ -230,7 +243,7 @@ def _entry_before_cutoff(raw: dict) -> bool:
                     dt = datetime.strptime(val, fmt)
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
-                    return dt < PREFILL_FIX_DATE
+                    return dt < COLLECTION_FIX_DATE  # use the later of the two dates
                 except ValueError:
                     continue
     return False

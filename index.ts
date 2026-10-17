@@ -135,6 +135,12 @@ interface CalibrationState {
 interface CalibrationBucket {
   charsPerToken: number;
   samples: number;
+  /** Tokens per second for a cold (uncached) prefill pass.
+   *  Derived from the first reliable entry per model and persisted
+   *  so subsequent cold entries can use it when the measured TTFT
+   *  is unreliable (before_provider_request fires too late). */
+  prefillRate: number;
+  prefillSamples: number;
 }
 
 let calibrationState: CalibrationState | null = loadCalibration();
@@ -160,7 +166,12 @@ function saveCalibration(state: CalibrationState): void {
 
 function getCalibrationBucket(state: CalibrationState, modelKey: string): CalibrationBucket {
   if (!state.models[modelKey]) {
-    state.models[modelKey] = { charsPerToken: 3.5, samples: 0 };
+    state.models[modelKey] = {
+      charsPerToken: 3.5,
+      samples: 0,
+      prefillRate: 0,
+      prefillSamples: 0,
+    };
   }
   return state.models[modelKey];
 }
@@ -223,8 +234,16 @@ export default function (pi: ExtensionAPI) {
     const m = activeMessage;
     const mk = modelKey(providerId, api, model);
 
-    // TTFT.
+    // TTFT — measured from request_start to first_token.
+    // NOTE: `before_provider_request` fires at the wrong time for
+    // subsequent requests in a session (it fires when the internal
+    // request is queued, not when the HTTP request is actually sent).
+    // This makes `ttftMs` impossibly small (5–23ms) for cold entries
+    // with 20K+ tokens.  When the measured TTFT is suspiciously small
+    // relative to a calibration-based prediction, we replace it with
+    // the calibrated estimate so prefillTps remains realistic.
     let ttftMs: number | undefined;
+    let ttftCalibrated = false;
     if (m.requestStartAt !== null) {
       ttftMs = round(m.firstChunkAt - m.requestStartAt, 1);
     }
@@ -253,6 +272,11 @@ export default function (pi: ExtensionAPI) {
     // Excludes cache-read tokens so prefillTps reflects actual server-side
     // prefill compute, not the artificially high rate caused by fast TTFT
     // when most tokens were served from KV-cache.
+    //
+    // For cold entries (cacheReadTokens == 0), the measured TTFT from
+    // before_provider_request is often unreliable (fires too late).
+    // When the measured TTFT is < 30% of what the calibration predicts
+    // for the input size, we replace it with the calibration estimate.
     let prefillTps: number | undefined;
     let cacheAwarePrefillTokens: number | undefined;
     if (isFiniteNumber(ttftMs) && ttftMs > 0 && inputTokens !== undefined && inputTokens > 0) {
@@ -265,7 +289,36 @@ export default function (pi: ExtensionAPI) {
       }
       // Only compute prefillTps when there is actual prefill work.
       if (cacheAware > 0) {
-        prefillTps = round(cacheAware / ttftSeconds, 2);
+        // Cold entry with large prompt: check if measured TTFT is reliable
+        if ((cacheReadTokens === undefined || cacheReadTokens === 0) && inputTokens !== undefined && inputTokens > 10_000) {
+          const calBucket = getCalibrationBucket(calibrationState, mk);
+          const calRate = calBucket.prefillRate;
+          if (calRate > 0) {
+            const predictedTTFT = inputTokens / calRate;  // seconds
+            // If measured TTFT is less than 30% of what calibration predicts,
+            // it means requestStartAt was recorded too late (before_provider_request bug).
+            // Replace measured TTFT with calibrated estimate.
+            if (ttftSeconds < predictedTTFT * 0.3) {
+              ttftMs = round(predictedTTFT * 1000, 1);
+              ttftCalibrated = true;
+            }
+          }
+        }
+        prefillTps = round(cacheAware / (ttftMs! / 1000), 2);
+      }
+    }
+
+    // Update calibration with this entry (cold entries only, use the
+    // (possibly calibrated) prefill rate for model learning).
+    if ((cacheReadTokens === undefined || cacheReadTokens === 0) && inputTokens !== undefined && inputTokens > 0) {
+      const actualTTFT = ttftMs !== undefined ? ttftMs / 1000 : 0;
+      if (actualTTFT > 0) {
+        const actualPrefillRate = round(inputTokens / actualTTFT, 2);
+        const calBucket = getCalibrationBucket(calibrationState, mk);
+        calBucket.prefillRate = calBucket.prefillSamples === 0
+          ? actualPrefillRate
+          : round(calBucket.prefillRate * 0.7 + actualPrefillRate * 0.3);
+        calBucket.prefillSamples++;
       }
     }
 
