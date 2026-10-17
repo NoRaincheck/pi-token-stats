@@ -29,10 +29,16 @@ import json
 import os
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 # ─── Constants ────────────────────────────────────────────────────────────────
+
+# The prefillTps fix (commit efac9aa) excluded cache reads from the calculation.
+# All data prior to this commit has incorrect prefill TPS values and must be
+# excluded from aggregation.  This date is the commit's author date in UTC.
+PREFILL_FIX_DATE = datetime(2026, 10, 17, 2, 49, 3, tzinfo=timezone.utc)
 
 SESSIONS_BASE = Path(
     os.environ.get(
@@ -190,6 +196,46 @@ def _median(sorted_vals: list[float]) -> float:
 
 # ─── File reading ─────────────────────────────────────────────────────────────
 
+TIMESTAMP_FIELDS = ["date", "timestamp", "time", "createdAt", "timeMs"]
+
+
+def _entry_before_cutoff(raw: dict) -> bool:
+    """Return True if a session entry was recorded before the prefill fix."""
+    for field in TIMESTAMP_FIELDS:
+        val = raw.get(field)
+        if val is None:
+            continue
+        # Handle epoch milliseconds
+        if isinstance(val, (int, float)) and val > 1e12:
+            try:
+                dt = datetime.fromtimestamp(val / 1000, tz=timezone.utc)
+                return dt < PREFILL_FIX_DATE
+            except (OSError, ValueError, OverflowError):
+                pass
+        # Handle ISO-8601 / RFC-3339 strings
+        if isinstance(val, str):
+            val = val.strip()
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S.%f%z",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f%z",
+                "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+            ):
+                try:
+                    dt = datetime.strptime(val, fmt)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt < PREFILL_FIX_DATE
+                except ValueError:
+                    continue
+    return False
+
+
 def jsonl_entries(path: Path):
     """Yield parsed JSON objects from a JSONL file."""
     try:
@@ -210,7 +256,12 @@ def jsonl_entries(path: Path):
 
 
 def find_entries(base: Path, verbose: bool = True):
-    """Yield all token_speed_stats entry data dicts from all sessions."""
+    """Yield all token_speed_stats entry data dicts from all sessions.
+
+    Entries whose *date / timestamp* falls before the prefillTps fix
+    (commit efac9aa, 2026-10-17) are silently excluded, because their
+    prefill TPS values are known to be incorrect.
+    """
     sessions_dir = base / "sessions"
     if not sessions_dir.is_dir():
         print(f"[WARN] sessions directory not found: {sessions_dir}",
@@ -224,13 +275,20 @@ def find_entries(base: Path, verbose: bool = True):
             continue
         seen.add(resolved)
         count = 0
+        filtered_out = 0
         for entry in jsonl_entries(jsonl_file):
             if (entry.get("type") == "custom"
                     and entry.get("customType") == ENTRY_TYPE):
+                raw = entry.get("data", {})
+                if _entry_before_cutoff(raw):
+                    filtered_out += 1
+                    continue
                 count += 1
-                yield entry.get("data", {})
+                yield raw
         if count and verbose:
-            print(f"  {jsonl_file.name}  ({count} entries)")
+            extra = (f" (excluded {filtered_out} pre-fix entries)"
+                     if filtered_out else "")
+            print(f"  {jsonl_file.name}  ({count} entries){extra}")
 
 
 # ─── Aggregation ──────────────────────────────────────────────────────────────
