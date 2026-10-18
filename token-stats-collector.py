@@ -10,9 +10,9 @@
 
 Walks ~/.pi/agent/sessions/**/*.jsonl, extracts ``token_speed_stats`` entries,
 bins by totalTokens (Short <4K, Medium 4–16K, Long 16–64K, XLarge 64K+)
-and cache level (cold / warm), then prints a summary table with median,
-quartiles, IQR, and mean grouped by (cacheLevel, contextBin).  PrefillTps is
-not reported — the measurement is unreliable due to a timing bug in the
+and cache level (cold / warm), then prints a colorized summary table with
+median, average, P95, and P99 grouped by (cacheLevel, contextBin).  PrefillTps
+is not reported — the measurement is unreliable due to a timing bug in the
 extension.
 
 Usage:

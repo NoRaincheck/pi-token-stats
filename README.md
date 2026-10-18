@@ -66,14 +66,15 @@ At the end of each turn (user prompt → final AI response), an aggregate summar
 |-------|-------------|
 | `ttftMs` | Time-to-first-token — wall time from provider request to first streamed chunk |
 | `decodeTps` | Decode throughput (tokens/second) during the live streaming window, excluding the first chunk |
-| `decodeTps` | Decode throughput (tokens/second) during the live streaming window, excluding the first chunk |
-| `prefillTps` | Effective prefill throughput: inputTokens / TTFT seconds. Includes network + queue latency — reflects end-to-end client experience, not pure server-side compute. |
-| `cacheAwarePrefillTokens` | Cache-aware effective prefill tokens (input − cache reads). When most of a prompt was served from KV-cache, raw TTFT is misleadingly small — this field estimates actual compute work instead. Absent if no cache reads reported. |
+| `genTps` | Generation throughput (tokens/second) including the first chunk |
 | `inputTokens` | Prompt tokens sent to the provider |
 | `outputTokens` | Tokens returned by the model |
-| `cacheReadTokens` | Cached prompt tokens from provider cache |
+| `cacheReadTokens` | Cached prompt tokens served from KV-cache |
 | `totalTokens` | Sum of all token categories |
 | `costTotal` | Total cost in USD for this message |
+| `costInput` | Cost for input (prompt) tokens in USD |
+| `costOutput` | Cost for output (generation) tokens in USD |
+| `cacheAwarePrefillTokens` | Cache-aware effective prefill tokens (input − cache reads). When most of a prompt was served from KV-cache, raw TTFT is misleadingly small — this field estimates actual compute work instead. Absent if no cache reads reported. |
 | `intermediateToolCalls` | Tool calls that ran between this request and response (useful when model uses tools) |
 
 ## Setup
@@ -145,16 +146,21 @@ jq -s 'group_by(.providerId) | map({provider: .[0].providerId, avgPrefillTps: (m
 uv run token-stats-collector.py
 ```
 
-Shows a compact summary table grouped by cache level (cold/warm) and context size (short/medium/long/xlarge). Each metric reports Median, Q1, Q3, IQR, and (for reference) mean/min/max:
+Produces a compact, colorized table grouped by cache level (cold / warm) and context bin (short < 4K, medium 4–16K, long 16–64K, xlarge 64K+). Each metric reports median, average, P95, and P99:
 
 ```
-  TTFT                 Median        Q1        Q3       IQR       Avg       Min       Max      Units
-  ─────────────      ──────────  ──────────  ──────────  ──────────  ──────────  ──────────  ──────────  ──────────
-  TTFT                     45.0      22.0      80.0      58.0       62.3       8.2     1250.0          ms
-  Decode TPS                95.0      60.0     140.0      80.0      102.5      12.5       250.0      tok/s
-  Gen TPS                  120.0      80.0     175.0      95.0      125.3      15.0       300.0      tok/s
-  Prefill TPS             5000.0    3000.0    8000.0     5000.0     5200.0     800.0    12000.0      tok/s
+────────────── session tokens: 2025-06 ──────────────
+  cache=cold  context=short [0–4,000]        (n=312)
+  cache=warm  context=short [0–4,000]        (n=451)
+  cache=cold  context=medium [4,000–16,000]  (n=98)
+  cache=warm  context=medium [4,000–16,000]  (n=187)
+
+  TTFT                     Median     Avg       P95      P99
+  Decode TPS              [green]95.0[/] [orange]102.5[/] [green]120.0[/] [cyan]140.0[/]  tok/s
+  Gen TPS                 [green]120.0[/] [green]125.3[/]  [green]145.0[/] [cyan]175.0[/]  tok/s
 ```
+
+(Example output above; actual values and color-coding vary by dataset. Color bands: red = slow, orange = medium, green = fast, cyan = blazing.)
 
 With flags:
 
@@ -181,7 +187,7 @@ PI_TOKEN_SPEED_STATS_DIR=/custom/path pi
 ## Notes
 
 - **TTFT** includes network latency, server queue time, prefill time, and first-chunk decode time. It is not pure prefill throughput.
-- **Prefill TPS (`prefillTps`)** = `inputTokens / (ttftMs / 1000)`. This is an effective client-side estimate — it reflects end-to-end experience from request send to first token arrival, which includes network round-trip time and server queue wait. It should not be interpreted as pure server-side prefill compute throughput.
+- **Prefill TPS (`prefillTps`)** was excluded from the summary report due to a known timing bug in the extension (values before calibration fix are unreliable). See the per-message `token_speed_stats` entries if you need it raw.
 - **Cache-aware prefill (`cacheAwarePrefillTokens`)** subtracts cache-read tokens from input to estimate actual compute work during prefill. When most of a prompt is served from KV-cache, raw TTFT can be very small — this field helps distinguish "fast because cached" from "fast because good hardware/network." Use `prefillTps` computed against just the uncached fraction for that comparison.
 - **Decode TPS** excludes tokens delivered in the very first chunk (which inflate the initial rate). It measures only the sustained streaming phase.
 - No status bar or live display — all data is recorded silently into the session JSONL for post-hoc analysis.
