@@ -348,6 +348,28 @@ export default function (pi: ExtensionAPI) {
       intermediateToolCalls: intermediateToolCallsForCurrentResponse || undefined,
     };
 
+    // Per-entry console print (human-readable, splash-like).
+    const status = (outputTokens === 0 && (stopReason === "cancelled" || stopReason === "cancel"))
+      ? "Cancelled"
+      : "Done";
+    const cacheLabel = (cacheReadTokens !== undefined && cacheReadTokens > 0)
+      ? `${cacheReadTokens.toLocaleString()}`
+      : "—";
+    const cacheAware = (cacheReadTokens !== undefined && cacheReadTokens > 0 && inputTokens !== undefined)
+      ? `${(inputTokens - cacheReadTokens).toLocaleString()}`
+      : "—";
+    const ttftStr = isFiniteNumber(entry.ttftMs)
+      ? `${(entry.ttftMs! / 1000).toFixed(1)}s` + (entry.ttftCalibrated ? "*" : "")
+      : "—";
+    const decodeStr = entry.decodeTps !== undefined
+      ? `${entry.decodeTps} tok/s` : "—";
+    console.log(
+      `[token_stats] ${status} · input ${inputTokens?.toLocaleString() ?? "?"} · cache ${cacheLabel} · ` +
+      `output ${outputTokens?.toLocaleString() ?? "?"} · cacheAware ${cacheAware} · ` +
+      `TTFT ${ttftStr} · decodeTps ${decodeStr}` +
+      `${entry.ttftCalibrated ? " (calibrated)" : ""}`,
+    );
+
     pi.appendEntry<TokenSpeedStatsEntry>(ENTRY_TYPE, entry);
     return entry;
   }
