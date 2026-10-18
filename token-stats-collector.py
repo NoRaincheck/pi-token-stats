@@ -3,6 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "rich>=13.0",
+#     "tqdm>=4.70.1",
 # ]
 # ///
 """pi-token-stats: aggregate and display session token statistics.
@@ -34,7 +35,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 from rich.console import Console
+from rich.rule import Rule
+from rich.table import Table, Column
 from rich.text import Text
+from tqdm import tqdm
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -53,10 +57,10 @@ SESSIONS_BASE = Path(
 ENTRY_TYPE = "token_speed_stats"
 
 CONTEXT_BINS: list[tuple[str, int | float, int | float]] = [
-    ("short",    0,       4_000),
-    ("medium", 4_000,    16_000),
-    ("long",  16_000,     64_000),
-    ("xlarge", 64_000,    float("inf")),
+    ("short", 0, 4_000),
+    ("medium", 4_000, 16_000),
+    ("long", 16_000, 64_000),
+    ("xlarge", 64_000, float("inf")),
 ]
 
 METRICS = ["ttftMs", "decodeTps", "genTps"]
@@ -85,7 +89,12 @@ def colorize_cache_label(label: str) -> Text:
 def colorize_context_label(label: str) -> Text:
     """Colorize context bin labels."""
     t = Text(label)
-    colors = {"short": "cyan", "medium": "yellow", "long": "magenta", "xlarge": "magenta"}
+    colors = {
+        "short": "cyan",
+        "medium": "yellow",
+        "long": "magenta",
+        "xlarge": "magenta",
+    }
     if label in colors:
         t.stylize(colors[label])
     return t
@@ -102,16 +111,17 @@ def colorize_metric_name(name: str) -> Text:
 
 # TPS performance bands for value colorization (tok/s)
 TPS_BANDS: list[tuple[int | float, str]] = [
-    (0, "#ff4444"),        # Slow (red)
-    (15, "#ffaa00"),       # Medium (orange)
-    (30, "#00ff88"),       # Fast (green)
-    (45, "#44ddff"),       # Blazing (cyan)
+    (0, "#ff4444"),  # Slow (red)
+    (15, "#ffaa00"),  # Medium (orange)
+    (30, "#00ff88"),  # Fast (green)
+    (45, "#44ddff"),  # Blazing (cyan)
 ]
 
 
 def colorize_tps_value(val: float) -> Text:
     """Colorize a TPS value based on performance bands."""
     import re as _re
+
     s = f"{val:.1f}"
     t = Text(s)
     for threshold, color in TPS_BANDS:
@@ -172,7 +182,9 @@ def prompt_model_selection(unique_models: list[str]) -> str | list[str]:
 
     max_retries = 3
     for attempt in range(1, max_retries + 1):
-        raw = input("  Select model(s) by number (comma-separated), or 0 for all: ").strip()
+        raw = input(
+            "  Select model(s) by number (comma-separated), or 0 for all: "
+        ).strip()
         if not raw:
             continue  # treat empty as re-prompt
         try:
@@ -183,13 +195,19 @@ def prompt_model_selection(unique_models: list[str]) -> str | list[str]:
             if not indices:
                 continue  # empty input → re-prompt
             if any(idx < 1 or idx > len(unique_models) for idx in indices):
-                print(f"  [ERROR] Index out of range (1–{len(unique_models)}). Try again.")
+                print(
+                    f"  [ERROR] Index out of range (1–{len(unique_models)}). Try again."
+                )
                 continue
             models_selected = [unique_models[idx - 1] for idx in indices]
             return models_selected
         except (ValueError, IndexError):
             remaining = max_retries - attempt
-            suffix = f" ({remaining} retry{'ies' if remaining != 1 else ''} left)" if remaining else ""
+            suffix = (
+                f" ({remaining} retry{'ies' if remaining != 1 else ''} left)"
+                if remaining
+                else ""
+            )
             print(f"  [ERROR] Invalid input.{suffix} Try again.")
 
     print("  [ERROR] Max retries reached. Exiting.", file=sys.stderr)
@@ -231,11 +249,34 @@ def total_tokens(raw: dict) -> int:
     t = raw.get("totalTokens")
     if t is not None:
         return int(t)
-    return int(raw.get("inputTokens") or 0) + int(raw.get("outputTokens") or 0) + int(raw.get("cacheReadTokens") or 0)
+    return (
+        int(raw.get("inputTokens") or 0)
+        + int(raw.get("outputTokens") or 0)
+        + int(raw.get("cacheReadTokens") or 0)
+    )
 
 
 def bin_label(ctx: str, lo: float, hi: float) -> str:
     return f"{ctx} [{fmt_range(lo, hi)}]"
+
+
+def fmt_ttft(val: float) -> str:
+    """Format a TTFT value for display.
+
+    Below 10 000 ms: show raw milliseconds (e.g. "2 847.3").
+    ≥ 10 000 ms but < 60 000 ms: show seconds with ms in parentheses
+      (e.g. "14.2s  (14200ms)").
+    ≥ 60 000 ms: show minutes with ms in parentheses
+      (e.g. "1m 40s  (100000ms)").
+    """
+    if val >= 60_000:
+        minutes = int(val // 60_000)
+        leftover_ms = val - minutes * 60_000
+        seconds_part = leftover_ms / 1000
+        return f"{minutes}m {seconds_part:.0f}s  ({val:.0f}ms)"
+    elif val >= 10_000:
+        return f"{val / 1000:.1f}s  ({val:.0f}ms)"
+    return f"{val:.1f}"
 
 
 def _percentile(sorted_vals: list[float], p: float) -> float:
@@ -283,20 +324,19 @@ def find_entries(base: Path, verbose: bool = True):
     """Yield all token_speed_stats entry data dicts from all sessions."""
     sessions_dir = base / "sessions"
     if not sessions_dir.is_dir():
-        print(f"[WARN] sessions directory not found: {sessions_dir}",
-              file=sys.stderr)
+        print(f"[WARN] sessions directory not found: {sessions_dir}", file=sys.stderr)
         return
 
     seen: set[Path] = set()
-    for jsonl_file in sorted(sessions_dir.rglob("*.jsonl")):
+    jsonl_files = sorted(sessions_dir.rglob("*.jsonl"))
+    for jsonl_file in tqdm(jsonl_files, desc="Scanning", unit="file"):
         resolved = jsonl_file.resolve()
         if resolved in seen:
             continue
         seen.add(resolved)
         count = 0
         for entry in jsonl_entries(jsonl_file):
-            if (entry.get("type") == "custom"
-                    and entry.get("customType") == ENTRY_TYPE):
+            if entry.get("type") == "custom" and entry.get("customType") == ENTRY_TYPE:
                 count += 1
                 yield entry.get("data", {})
         if count and verbose:
@@ -304,6 +344,7 @@ def find_entries(base: Path, verbose: bool = True):
 
 
 # ─── Aggregation ──────────────────────────────────────────────────────────────
+
 
 def aggregate(entries: list[dict]) -> tuple[dict[str, dict], set[str]]:
     groups: dict[str, dict] = {}
@@ -352,6 +393,7 @@ def aggregate(entries: list[dict]) -> tuple[dict[str, dict], set[str]]:
 
 # ─── Display ──────────────────────────────────────────────────────────────────
 
+
 def display(groups: dict[str, dict], all_models: set[str]) -> None:
     if not groups:
         print(
@@ -360,22 +402,19 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
         )
         return
 
-    sep = "=" * 72
-    thin_sep = "-" * 72
-
-    c(f"\n{sep}")
-    header = Text("  PI TOKEN STATISTICS — Aggregated from session JSONL")
-    header.stylize("bold")
-    c(header)
-    c(f"  Sessions dir: {SESSIONS_BASE / 'sessions'}")
-    total_line = Text(f"  Total groups: {len(groups)}  (cold/warm × short/medium/long/xlarge)")
-    total_line.stylize("bold blue")
-    c(total_line)
-    if all_models:
-        c(f"  Models included:  " + ", ".join(sorted(all_models)))
-    else:
-        c("  Models included:  (unknown)")
-    c(sep)
+    # Header as a Rich Table (rows → columns, with visible borders)
+    hdr = Table(show_header=False, show_edge=True)
+    hdr.add_column("", style="bold", width=20)
+    hdr.add_column("", width=80)
+    hdr.add_row("Sessions dir:", str(SESSIONS_BASE / "sessions"))
+    hdr.add_row(
+        "Total groups:", f"{len(groups)}  (cold/warm × short/medium/long/xlarge)"
+    )
+    hdr.add_row(
+        "Models included:", ", ".join(sorted(all_models)) if all_models else "(unknown)"
+    )
+    c(hdr)
+    c(Rule())
 
     # Sort: cold before warm, short before xlarge
     order_cache = {"cold": 0, "warm": 1}
@@ -402,8 +441,8 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
         group_title = Text(f"  {cache_text} × {context_part}")
         count_text = Text(f"  (n = {g['count']})")
         count_text.stylize("dim")
-        c(f"\n{thin_sep}")
         c(f"  {group_title}     ", count_text)
+        c()  # blank line
 
         # Summary table with median, Q1, Q3, IQR, plus mean for reference
         labels = {
@@ -417,92 +456,86 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
             "genTps": "tok/s",
         }
 
-        hdr = (f"  {'Metric':<16}"
-               f" {'Median':>10}  {'Q1':>10}  {'Q3':>10}  {'IQR':>10}"
-               f" {'Avg':>10}  {'Min':>12}  {'Max':>12}  {'Units':>10}")
-        sep_line = (f"  {'─' * 14}  {'─' * 10}  {'─' * 10}  {'─' * 10}  {'─' * 10}"
-                    f"  {'─' * 10}  {'─' * 12}  {'─' * 12}  {'─' * 10}")
-        c(hdr)
-        c(sep_line)
+        # Build a Rich Table — columns, widths, and alignment handled by Rich.
+        table = Table(show_header=True, show_edge=False, expand=False)
+        table.add_column("Metric", style="bold", width=16)
+        table.add_column("Median", justify="right")
+        table.add_column("Avg", justify="right")
+        table.add_column("P95", justify="right")
+        table.add_column("P99", justify="right")
 
         for m in METRICS:
             vals = g[m]
             if not vals:
                 continue
             avg = round(sum(vals) / len(vals), 1)
-            mn, mx = round(min(vals), 1), round(max(vals), 1)
             s = sorted(vals)
             median = round(_median(s), 1)
-            q1 = round(_percentile(s, 25), 1)
-            q3 = round(_percentile(s, 75), 1)
-            iqr = round(q3 - q1, 1)
-            row = (f"  {labels[m]:<16} {median:>10.1f}  {q1:>10.1f}  {q3:>10.1f}  {iqr:>10.1f}"
-                  f"  {avg:>10.1f}  {mn:>12.1f}  {mx:>12.1f}  "
-                  f"{units[m]:>10}")
-            # Colorize the metric name portion
-            metric_name = labels[m]
-            colored_row = Text(row)
-            metric_start = row.find(metric_name)
-            if metric_start >= 0:
-                colored_row.stylize("bold", metric_start, metric_start + len(metric_name))
-            # Colorize TPS values by performance band
-            if m == "decodeTps" or m == "genTps":
-                import re
-                # Match all numeric values in the row (after the metric name)
-                for num_match in re.finditer(r"\d+\.\d+", row):
-                    num_start, num_end = num_match.span()
-                    if num_start > metric_start + len(metric_name):
-                        try:
-                            num_val = float(num_match.group())
-                            # Get the color for this value
-                            color = None
-                            for threshold, clr in TPS_BANDS:
-                                if num_val <= threshold:
-                                    color = clr
-                                    break
-                            if color:
-                                colored_row.stylize(color, num_start, num_end)
-                        except ValueError:
-                            pass
-            c(colored_row)
+            p95 = round(_percentile(s, 95), 1)
+            p99 = round(_percentile(s, 99), 1)
+            if m == "ttftMs":
+                table.add_row(
+                    colorize_metric_name(labels[m]),
+                    fmt_ttft(median),
+                    fmt_ttft(avg),
+                    fmt_ttft(p95),
+                    fmt_ttft(p99),
+                )
+            else:
+                table.add_row(
+                    colorize_metric_name(labels[m]),
+                    colorize_tps_value(median),
+                    colorize_tps_value(avg),
+                    colorize_tps_value(p95),
+                    colorize_tps_value(p99),
+                )
 
-    c(f"\n{sep}")
+        c(table)
+
+    c(Rule())
     footer = Text("  End of report.")
     footer.stylize("dim")
     c(footer)
-    c(sep)
 
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Aggregate pi token_speed_stats from session JSONL files.",
     )
     parser.add_argument(
-        "--sessions", type=Path, default=None,
+        "--sessions",
+        type=Path,
+        default=None,
         help=f"Base directory (default: {SESSIONS_BASE}).",
     )
     parser.add_argument(
-        "--json", action="store_true", default=False,
+        "--json",
+        action="store_true",
+        default=False,
         help="Output raw JSON instead of the formatted report.",
     )
     parser.add_argument(
-        "--filter-model", type=str, default=None,
+        "--filter-model",
+        type=str,
+        default=None,
         help="Only include entries matching this model name (substring).",
     )
     parser.add_argument(
-        "--no-plot", action="store_true", default=False,
+        "--no-plot",
+        action="store_true",
+        default=False,
         help="(deprecated, no longer has any effect — plots have been removed).",
     )
     args = parser.parse_args()  # accepts --no-plot for backward compat, then ignores it
 
     base = args.sessions or SESSIONS_BASE
 
-    # Phase 1: collect ALL entries to discover models
-    all_entries: list[dict[str, Any]] = []
-    for raw in find_entries(base, verbose=not args.json):
-        all_entries.append(raw)
+    # Phase 1: collect ALL entries (tqdm in find_entries shows real-time progress).
+    entries_list = list(find_entries(base, verbose=False))
+    all_entries: list[dict[str, Any]] = entries_list
 
     # Phase 2: apply model filtering
     if args.filter_model:
@@ -522,8 +555,7 @@ def main() -> None:
                 all_raw = all_entries  # no filtering
             else:
                 all_raw = [
-                    raw for raw in all_entries
-                    if (raw.get("model") or "") in selection
+                    raw for raw in all_entries if (raw.get("model") or "") in selection
                 ]
         else:
             all_raw = all_entries  # no models found, proceed anyway
@@ -531,8 +563,6 @@ def main() -> None:
     if args.json:
         print(json.dumps(all_raw, indent=2, default=str))
         return
-
-
 
     groups, all_models = aggregate(all_raw)
     display(groups, all_models)
