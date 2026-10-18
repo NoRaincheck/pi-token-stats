@@ -11,7 +11,7 @@
 Walks ~/.pi/agent/sessions/**/*.jsonl, extracts ``token_speed_stats`` entries,
 bins by totalTokens (Short <4K, Medium 4–16K, Long 16–64K, XLarge 64K+)
 and cache level (cold / warm), then prints a colorized summary table with
-median, average, P95, and P99 grouped by (cacheLevel, contextBin).  PrefillTps
+median, average, P80, and P90 grouped by (cacheLevel, contextBin).  PrefillTps
 is not reported — the measurement is unreliable due to a timing bug in the
 extension.
 
@@ -81,6 +81,8 @@ def colorize_cache_label(label: str) -> Text:
     t = Text(label)
     if label == "cold":
         t.stylize("bold red")
+    elif label == "cool":
+        t.stylize("bold yellow")
     elif label == "warm":
         t.stylize("bold green")
     return t
@@ -129,6 +131,40 @@ def colorize_tps_value(val: float) -> Text:
             t.stylize(color)
             return t
     # Fallback (val > 45)
+    t.stylize("#44ddff")
+    return t
+
+
+TTFT_BANDS: list[tuple[int | float, str]] = [
+    (45, "#ff4444"),  # Slow (red) — worst TTFT
+    (30, "#ffaa00"),  # Medium (orange)
+    (15, "#00ff88"),  # Fast (green)
+    (0, "#44ddff"),   # Blazing (cyan) — best TTFT
+]
+
+
+def colorize_ttft_value(val: float) -> Text:
+    """Colorize a TTFT value — lower (faster) is better.
+
+    P99 (slowest) gets red, P50 (fastest) gets green/cyan.
+    Inverse of TPS where high = good.
+    Formats via ``fmt_ttft`` and applies performance-band coloring.
+    """
+    display = fmt_ttft(val)
+    # Parse the raw ms value for threshold comparison
+    try:
+        # Try extracting the raw numeric value (before 's' or 'm' suffixes)
+        import re as _re
+        match = _re.search(r"([\d.]+)", display)
+        ms_val = float(match.group(1)) if match else val
+    except (ValueError, AttributeError):
+        ms_val = val
+    t = Text(display)
+    for threshold, color in TTFT_BANDS:
+        if ms_val >= threshold:
+            t.stylize(color)
+            return t
+    # Fallback (val <= 0)
     t.stylize("#44ddff")
     return t
 
@@ -224,19 +260,29 @@ def context_bin(totalTokens: int) -> str:
 def cache_level(raw: dict) -> str:
     """Return the cache level for a session entry.
 
-    Cache level describes whether the KV-cache was leveraged for this request:
+    Cache level describes whether the KV-cache was leveraged for this request,
+    based on the cache hit ratio (cacheReadTokens / inputTokens):
 
-    - **"warm"**: cacheReadTokens > 0. Some (or all) input tokens were served
-      directly from the prompt cache (KV-cache hit). The server skips the
-      prefill phase for cached tokens, so TTFT is shorter and total cost is
-      lower. A warm request may still incur prefill work for *new* tokens
-      that do not appear in the cache.
+    - **"warm"**: cacheHitRatio ≥ 50 %. A substantial portion of the prompt was
+      served from the KV-cache, so the server skips most or all of the prefill
+      phase. TTFT is short and total cost is lower.
 
-    - **"cold"**: cacheReadTokens == 0. No input tokens were cached, so the
-      full prefill pass over every input token was performed. This reflects
-      the worst-case latency and cost for this model.
+    - **"cool"**: cacheHitRatio ∈ (0 %, 50 %). Only a partial fraction of the
+      prompt was served from cache. TTFT is reduced but the benefit is smaller
+      than for a fully warm request.
+
+    - **"cold"**: cacheReadTokens == 0. No tokens were cached, so the full
+      prefill pass over every input token was performed. This reflects the
+      worst-case latency and cost for this model.
     """
-    return "warm" if (raw.get("cacheReadTokens") or 0) > 0 else "cold"
+    cacheRead = raw.get("cacheReadTokens") or 0
+    inputTok  = raw.get("inputTokens") or 0
+    cacheHitRatio = cacheRead / inputTok if inputTok > 0 else 0.0
+    if cacheHitRatio == 0:
+        return "cold"
+    if cacheHitRatio < 0.5:
+        return "cool"
+    return "warm"
 
 
 def fmt_range(lo: float, hi: float) -> str:
@@ -388,6 +434,9 @@ def aggregate(entries: list[dict]) -> tuple[dict[str, dict], set[str]]:
         g["inputTokens"].append(int(raw.get("inputTokens") or 0))
         g["outputTokens"].append(int(raw.get("outputTokens") or 0))
 
+    # Filter out groups with fewer than 32 samples
+    groups = {k: v for k, v in groups.items() if v["count"] >= 32}
+
     return groups, all_models
 
 
@@ -416,8 +465,8 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
     c(hdr)
     c(Rule())
 
-    # Sort: cold before warm, short before xlarge
-    order_cache = {"cold": 0, "warm": 1}
+    # Sort: cold before cool before warm, short before xlarge
+    order_cache = {"cold": 0, "cool": 1, "warm": 2}
     order_bin = {"short": 0, "medium": 1, "long": 2, "xlarge": 3}
     sorted_keys = sorted(
         groups.keys(),
@@ -429,8 +478,6 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
 
     for key in sorted_keys:
         g = groups[key]
-        if g["count"] == 0:
-            continue
 
         # Parse the group label to colorize cache/context parts
         parts = g["label"].split(" × ")
@@ -461,8 +508,8 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
         table.add_column("Metric", style="bold", width=16)
         table.add_column("Median", justify="right")
         table.add_column("Avg", justify="right")
-        table.add_column("P95", justify="right")
-        table.add_column("P99", justify="right")
+        table.add_column("P80", justify="right")
+        table.add_column("P90", justify="right")
 
         for m in METRICS:
             vals = g[m]
@@ -471,26 +518,33 @@ def display(groups: dict[str, dict], all_models: set[str]) -> None:
             avg = round(sum(vals) / len(vals), 1)
             s = sorted(vals)
             median = round(_median(s), 1)
-            p95 = round(_percentile(s, 95), 1)
-            p99 = round(_percentile(s, 99), 1)
+            # TPS: p90 = 10th percentile (slow), p80 = 20th percentile
+            # TTFT: p90 = 90th percentile (slow), p80 = 80th percentile
+            if m in ("decodeTps", "genTps"):
+                p80 = round(_percentile(s, 20), 1)   # 20th pct = slow
+                p90 = round(_percentile(s, 10), 1)   # 10th pct = slowest
+            else:
+                p80 = round(_percentile(s, 80), 1)
+                p90 = round(_percentile(s, 90), 1)
             if m == "ttftMs":
                 table.add_row(
                     colorize_metric_name(labels[m]),
-                    fmt_ttft(median),
-                    fmt_ttft(avg),
-                    fmt_ttft(p95),
-                    fmt_ttft(p99),
+                    colorize_ttft_value(median),
+                    colorize_ttft_value(avg),
+                    colorize_ttft_value(p80),
+                    colorize_ttft_value(p90),
                 )
             else:
                 table.add_row(
                     colorize_metric_name(labels[m]),
                     colorize_tps_value(median),
                     colorize_tps_value(avg),
-                    colorize_tps_value(p95),
-                    colorize_tps_value(p99),
+                    colorize_tps_value(p80),
+                    colorize_tps_value(p90),
                 )
 
         c(table)
+        c()  # spacing line after each table
 
     c(Rule())
     footer = Text("  End of report.")

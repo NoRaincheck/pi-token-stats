@@ -143,30 +143,36 @@ jq -s 'group_by(.providerId) | map({provider: .[0].providerId, avgPrefillTps: (m
 ### Token statistics summary table
 
 ```bash
-uv run token-stats-collector.py
+uv run --script token-stats-collector.py
 ```
 
-Produces a compact, colorized table grouped by cache level (cold / warm) and context bin (short < 4K, medium 4–16K, long 16–64K, xlarge 64K+). Each metric reports median, average, P95, and P99:
+Produces a compact, colorized table grouped by cache level (cold / cool / warm) and context bin (short < 4K, medium 4–16K, long 16–64K, xlarge 64K+). Each metric reports median, average, P80, and P90:
 
 ```
 ────────────── session tokens: 2025-06 ──────────────
   cache=cold  context=short [0–4,000]        (n=312)
+  cache=cool  context=short [0–4,000]        (n=87)
   cache=warm  context=short [0–4,000]        (n=451)
   cache=cold  context=medium [4,000–16,000]  (n=98)
+  cache=cool  context=medium [4,000–16,000]  (n=62)
   cache=warm  context=medium [4,000–16,000]  (n=187)
 
-  TTFT                     Median     Avg       P95      P99
-  Decode TPS              [green]95.0[/] [orange]102.5[/] [green]120.0[/] [cyan]140.0[/]  tok/s
-  Gen TPS                 [green]120.0[/] [green]125.3[/]  [green]145.0[/] [cyan]175.0[/]  tok/s
+  TTFT                      Median     Avg       P80      P90
+  Decode TPS               [green]95.0[/] [orange]102.5[/] [green]120.0[/] [cyan]140.0[/]  tok/s
+  Gen TPS                  [green]120.0[/] [green]125.3[/]  [green]145.0[/] [cyan]175.0[/]  tok/s
+  Cache hit ratio          [green]23.4%[/]  [green]28.1%[/]  [green]42.5%[/]  [green]48.7%[/]
 ```
 
-(Example output above; actual values and color-coding vary by dataset. Color bands: red = slow, orange = medium, green = fast, cyan = blazing.)
+(Example output above; actual values and color-coding vary by dataset. Cache bands: red = cold (0 % cached), yellow = cool (0–50 % cached), green = warm (≥ 50 % cached). TPS color bands: red = slow, orange = medium, green = fast, cyan = blazing. TTFT is inverted: cyan/green = fast (good), orange/red = slow (bad). Percentiles for TPS — p50 (fastest) is best, p80/p90 (slowest) are worst. For TTFT — p90 (slowest) is worst, p50 (fastest) is best.)
 
 With flags:
 
 ```bash
-uv run token-stats-collector.py --filter-model claude  # only Claude models
-uv run token-stats-collector.py --json                 # raw JSON output
+uv run --script token-stats-collector.py --filter-model claude  # only Claude models
+uv run --script token-stats-collector.py --json                 # raw JSON output
+uv run --script token-stats-collector.py --sessions /custom/path  # custom sessions dir
+uv run --script token-stats-collector.py  # interactive model selection
+uv run --script token-stats-collector.py --filter-model 3.6  # filter by substring (e.g. "3.6")
 ```
 
 ## Calibration
